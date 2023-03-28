@@ -5,7 +5,7 @@ pudb
 invisible-watermark
 imageio
 imageio-ffmpeg
-pytorch-lightnin
+pytorch-lightning
 omegaconf
 test-tube
 streamlit
