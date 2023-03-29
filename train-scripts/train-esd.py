@@ -207,7 +207,11 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
                                                                  start_code=code, till_T=t, verbose=False)
 
     losses = []
-    opt = torch.optim.Adam(parameters, lr=lr)
+    if args.use_8bit_adam:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit
+    else:
+        opt = torch.optim.Adam(parameters, lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
 
@@ -305,6 +309,11 @@ if __name__ == '__main__':
     parser.add_argument('--seperator', help='separator if you want to train bunch of words separately', type=str, required=False, default=None)
     parser.add_argument('--image_size', help='image size used to train', type=int, required=False, default=512)
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=50)
+    parser.add_argument(
+        "--use_8bit_adam",
+        action="store_true",
+        help="use 8bit AdamW optimizer (requires bitsandbytes)",
+    )
     args = parser.parse_args()
     
     prompt = args.prompt
