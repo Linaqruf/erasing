@@ -1,9 +1,5 @@
 from omegaconf import OmegaConf
-import torch.optim.lr_scheduler as lr_scheduler
-
-from safetensors.torch import load_file, save_file
-
-import sys; sys.path.append('.')
+from safetensors.torch import save_file, load_file
 import torch
 from torch import autocast
 from PIL import Image
@@ -33,7 +29,7 @@ from PIL import Image
 def is_safetensors(path):
     return os.path.splitext(path)[1].lower() == '.safetensors'
 
-def load_model_from_config(config, ckpt, device='cpu', verbose=False):
+def load_model_from_config(config, ckpt, device="cpu", verbose=False):
     """Loads a model from config and a ckpt
     if config is a path will use omegaconf to load
     """
@@ -41,11 +37,11 @@ def load_model_from_config(config, ckpt, device='cpu', verbose=False):
         config = OmegaConf.load(config)
 
     if is_safetensors(ckpt):
-        sd = load_file(ckpt, "cuda")
+        sd = load_file(ckpt, device=location)
     else:
-        pl_sd = torch.load(ckpt, map_location='cuda')
+        pl_sd = torch.load(ckpt, map_location=location)
         sd = pl_sd["state_dict"] if "state_dict" in pl_sd else pl_sd
-
+        
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)
     model.to(device)
@@ -119,45 +115,6 @@ def get_models(config_path, ckpt_path, devices):
 
     return model_orig, sampler_orig, model, sampler
 
-def parse_input_string(input_str):
-    params = {
-        "alpha": 1.0,  # Default alpha value
-    }
-
-    # Split the input string by ':' to get the concepts and parameters
-    parts = input_str.split(':')
-
-    # Set the concept
-    params["concept"] = parts[0]
-
-    # Iterate through the remaining parts to parse parameters
-    for part in parts[1:]:
-        # Check if the parameter has a '=' sign, indicating a key-value pair
-        if '=' in part:
-            key, value = part.split('=', 1)
-            params[key] = float(value)
-        else:
-            # If it's just a value, assume it's the alpha value
-            params["alpha"] = float(part)
-
-    return params
-
-
-def select_rules(rules, num_rules):
-    if num_rules > len(rules):
-        raise ValueError("num_rules must be less than or equal to the length of the rules list.")
-
-    selected_rules = [rule for rule in rules if rule.startswith('@')]
-
-    if num_rules == 1 and len(rules) == 1:
-        selected_rules = rules
-    else:
-        while num_rules > len(selected_rules):
-            remaining_rules = [rule for rule in rules if rule not in selected_rules]
-            selected_rules.append(random.choice(remaining_rules))
-
-    return selected_rules
-
 def write_sample_png(name, model, sampler, sample_start_code, sample_emb, step, ddim_steps):
     start_code = sample_start_code
     device = sample_start_code.device
@@ -190,8 +147,8 @@ def write_sample_png(name, model, sampler, sample_start_code, sample_emb, step, 
                 x_sample = x_sample.astype(np.uint8)
                 img = Image.fromarray(x_sample)
                 img.save(f"{name}/{step:05}.png")
-
-def train_esd(prompt, train_method, start_guidance, negative_guidance, iterations, lr, config_path, ckpt_path, diffusers_config_path, devices, seperator=None, image_size=512, ddim_steps=50, sample_prompt=None, accumulation_steps=1, mod_count=3):
+                
+def train_esd(prompt, train_method, start_guidance, negative_guidance, iterations, lr, config_path, ckpt_path, diffusers_config_path, devices, seperator=None, image_size=512, ddim_steps=50,  sample_prompt=None, accumulation_steps=1):
     '''
     Function to train diffusion models to erase concepts from model weights
 
@@ -223,8 +180,6 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
         Image size for generated images. The default is 512.
     ddim_steps : int, optional
         Number of diffusion time steps. The default is 50.
-    mod_count : int, optional
-        Number of conceptmods to run in parallel. The default is 2.
 
     Returns
     -------
@@ -232,7 +187,14 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
 
     '''
     # PROMPT CLEANING
+
     word_print = prompt.replace(' ','')
+    if prompt == 'allartist':
+        prompt = "Kelly Mckernan, Thomas Kinkade, Ajin Demi Human, Alena Aenami, Tyler Edlin, Kilian Eng"
+    if prompt == 'i2p':
+        prompt = "hate, harassment, violence, suffering, humiliation, harm, suicide, sexual, nudity, bodily fluids, blood"
+    if prompt == "artifact":
+        prompt = "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, mutation, mutated, extra limbs, extra legs, extra arms, disfigured, deformed, cross-eye, body out of frame, blurry, bad art, bad anatomy, blurred, text, watermark, grainy"
 
     if seperator is not None:
         words = prompt.split(seperator)
@@ -297,15 +259,14 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
         opt = bnb.optim.AdamW8bit(parameters, lr=lr)
     else:
         opt = torch.optim.Adam(parameters, lr=lr)
-    scheduler = lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=100, verbose=True, threshold=1e-4)
+
     criteria = torch.nn.MSELoss()
     history = []
 
     name = f'compvis-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{negative_guidance}-iter_{iterations}-lr_{lr}'
-    name = name[0:50]
     # TRAINING CODE
     pbar = tqdm(range(iterations))
-
+    
     if sample_prompt is not None:
         sample_start_code = torch.randn((1, 4, 64, 64)).to(devices[0])
         sample_emb = model.get_learned_conditioning([sample_prompt])
@@ -313,172 +274,40 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
         os.makedirs("samples/"+name, exist_ok=True)
         write_sample_png("samples/"+name, model, sampler, sample_start_code, sample_emb, 0, ddim_steps)
     accumulation_counter=0
-
+    
     for i in pbar:
-        num_rules = mod_count
-        rules = select_rules(words, num_rules)
-        rules = [s[1:] if s.startswith("@") else s for s in rules]
-        print("Selected:", rules)
-        #model_orig.load_state_dict(model.state_dict())
+        word = random.sample(words,1)[0]
+        # get text embeddings for unconditional and conditional prompts
+        emb_0 = model.get_learned_conditioning([''])
+        emb_p = model.get_learned_conditioning([word])
+        emb_n = model.get_learned_conditioning([f'{word}'])
 
         opt.zero_grad()
 
-        rule_losses = []
-        for rule_params in rules:
-            rule_index = rules.index(rule_params)
-            rule_obj = parse_input_string(rule_params)
-            rule = rule_obj['concept']
+        t_enc = torch.randint(ddim_steps, (1,), device=devices[0])
+        # time step from 1000 to 0 (0 being good)
+        og_num = round((int(t_enc)/ddim_steps)*1000)
+        og_num_lim = round((int(t_enc+1)/ddim_steps)*1000)
 
-            start_code = torch.randn((1, 4, 64, 64)).to(devices[0])
-            t_enc = torch.randint(ddim_steps, (1,), device=devices[0])
-            og_num = round((int(t_enc)/ddim_steps)*1000)
-            og_num_lim = round((int(t_enc+1)/ddim_steps)*1000)
-            t_enc_ddpm = torch.randint(og_num, og_num_lim, (1,), device=devices[0])
-            insertion_guidance=negative_guidance
+        t_enc_ddpm = torch.randint(og_num, og_num_lim, (1,), device=devices[0])
 
+        start_code = torch.randn((1, 4, 64, 64)).to(devices[0])
 
-            if '=' in rule:
-                # Handle the concept replacement case (original=target)
-                concepts = rule.split('=')
-                original_concept = concepts[0]
-                target_concept = concepts[1]
-
-                # Get text embeddings for unconditional and conditional prompts
-                emb_0 = model.get_learned_conditioning([''])
-                emb_o = model.get_learned_conditioning([original_concept])
-                emb_t = model.get_learned_conditioning([target_concept])
-
-                with torch.no_grad():
-                    # Generate an image with the target concept from ESD model
-                    z = quick_sample_till_t(emb_t.to(devices[0]), start_guidance, start_code, int(t_enc))
-
-                    # Get conditional and unconditional scores from frozen model at time step t and image z
-                    e_0 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_0.to(devices[1]))
-                    e_o = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_t.to(devices[1]))
-
-                # Get conditional scores from ESD model for the original concept
-                e_t = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_o.to(devices[0]))
-
-                # Compute the loss function for concept replacement
-                loss_replacement = criteria(e_t.to(devices[0]), e_0.to(devices[0]) - (negative_guidance * (e_o.to(devices[0]) - e_0.to(devices[0]))))
-                loss_rule = rule_obj['alpha']*loss_replacement
-                rule_losses.append(loss_rule)
-
-            elif '#' in rule:
-                concepts = rule.split('#')
-                original_concept = concepts[0]
-                target_concept = concepts[1]
-
-                emb_o = model.get_learned_conditioning([original_concept])
-                emb_t = model.get_learned_conditioning([target_concept])
-
-                with torch.no_grad():
-                    z = quick_sample_till_t(emb_t.to(devices[0]), start_guidance, start_code, int(t_enc))
-                    e_o = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_t.to(devices[1]))
-
-                e_t = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_o.to(devices[0]))
-
-                loss_replacement = criteria(e_t.to(devices[0]), e_o.to(devices[0]))
-                loss_rule = rule_obj['alpha']*loss_replacement
-                rule_losses.append(loss_rule)
-
-            elif '++' == rule[-2:] or rule[-2:] == '--':
-                # Handle the concept insertion case (concept++)
-                concept_to_insert = rule[:-2]
-                if rule[:-2] == '--':
-                    insertion_guidance = -insertion_guidance
-
-                # Get text embeddings for unconditional and conditional prompts
-                emb_0 = model.get_learned_conditioning([''])
-                emb_i = model.get_learned_conditioning([concept_to_insert])
-
-                with torch.no_grad():
-                    # Generate an image from ESD model
-                    z = quick_sample_till_t(emb_0.to(devices[0]), start_guidance, start_code, int(t_enc))
-
-                    # Get conditional and unconditional scores from frozen model at time step t and image z
-                    e_0 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_0.to(devices[1]))
-                    e_i = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_i.to(devices[1]))
-
-                # Get conditional scores from ESD model for the concept to insert
-                e_t = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_i.to(devices[0]))
-
-                # Compute the loss function to encourage the presence of the concept in the generated images
-                loss_i = criteria(e_t.to(devices[0]), e_0.to(devices[0]) - (insertion_guidance * (e_i.to(devices[0]) - e_0.to(devices[0]))))
-                loss_rule = rule_obj["alpha"]*loss_i
-                rule_losses.append(loss_rule)
-
-
-            elif '%' in rule:
-                # Handle the concept orthogonality case (concept1%concept2)
-                concept1, concept2 = rule.split('%')
-                # Get text embeddings for unconditional and conditional prompts
-                emb_0 = model.get_learned_conditioning([''])
-
-                emb_c1 = model.get_learned_conditioning([concept1])
-                emb_c2 = model.get_learned_conditioning([concept2])
-
-                with torch.no_grad():
-                    # Generate an image from ESD model
-                    z = quick_sample_till_t(emb_0.to(devices[0]), start_guidance, start_code, int(t_enc))
-
-                    # Get conditional and unconditional scores from frozen model at time step t and image z
-                    e_0 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_0.to(devices[1]))
-                    output_c1 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_c1.to(devices[1]))
-
-                # Get conditional scores from ESD model for the two concepts
-                output_c2 = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_c2.to(devices[0]))
-                diff_c1 = output_c1 - e_0
-                diff_c2 = output_c2 - e_0.to(devices[0])
-
-                diff_c1_flat = diff_c1.view(1, -1)
-                diff_c2_flat = diff_c2.view(1, -1)
-                # Normalize the output embeddings
-                normalized_output_c1 = diff_c1_flat / (torch.norm(diff_c1_flat, dim=1, keepdim=True)+1e-8)
-                normalized_output_c2 = diff_c2_flat / (torch.norm(diff_c2_flat, dim=1, keepdim=True)+1e-8)
-
-                # Calculate the cosine similarity between the normalized output embeddings
-                cosine_similarity = torch.abs(torch.dot(normalized_output_c1.view(-1).to(devices[0]), normalized_output_c2.view(-1).to(devices[0])))
-
-                loss_rule = rule_obj["alpha"]*0.01*cosine_similarity
-                rule_losses.append(loss_rule)
-
-            elif rule[-1] == '^':
-                raise ValueError('^ removed (use ++)')
-
-            # Handle the concept removal case (concept--)
-            elif rule[-2:] == '--':
-                concept_to_reduce = rule[:-2]
-
-                # Get text embeddings for unconditional and conditional prompts
-                emb_0 = model.get_learned_conditioning([''])
-                emb_r = model.get_learned_conditioning([concept_to_reduce])
-
-                with torch.no_grad():
-                    # Generate an image from ESD model
-                    z = quick_sample_till_t(emb_0.to(devices[0]), -start_guidance, start_code, int(t_enc))
-
-                    # Get conditional and unconditional scores from frozen model at time step t and image z
-                    e_0 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_0.to(devices[1]))
-                    e_r = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_r.to(devices[1]))
-
-                # Get conditional scores from ESD model for the concept to reduce
-                e_t = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_r.to(devices[0]))
-
-                # Compute the loss function to discourage the presence of the concept in the generated images
-                loss_i = criteria(e_t.to(devices[0]), e_0.to(devices[0]) + (insertion_guidance * (e_r.to(devices[0]) - e_0.to(devices[0]))))
-
-                loss_rule = rule_obj["alpha"]*loss_i
-                rule_losses.append(loss_rule)
-            else:
-                assert False, "Unable to parse rule: "+rule
-
-
-        loss = sum(rule_losses)
-        # Update weights to erase or reinforce the concept(s)
+        with torch.no_grad():
+            # generate an image with the concept from ESD model
+            z = quick_sample_till_t(emb_p.to(devices[0]), start_guidance, start_code, int(t_enc)) # emb_p seems to work better instead of emb_0
+            # get conditional and unconditional scores from frozen model at time step t and image z
+            e_0 = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_0.to(devices[1]))
+            e_p = model_orig.apply_model(z.to(devices[1]), t_enc_ddpm.to(devices[1]), emb_p.to(devices[1]))
+        # breakpoint()
+        # get conditional score from ESD model
+        e_n = model.apply_model(z.to(devices[0]), t_enc_ddpm.to(devices[0]), emb_n.to(devices[0]))
+        e_0.requires_grad = False
+        e_p.requires_grad = False
+        # reconstruction loss for ESD objective from frozen model and conditional score of ESD model
+        loss = criteria(e_n.to(devices[0]), e_0.to(devices[0]) - (negative_guidance*(e_p.to(devices[0]) - e_0.to(devices[0])))) #loss = criteria(e_n, e_0) works the best try 5000 epochs
+        # update weights to erase the concept
         loss.backward()
-        for j, r in enumerate(rule_losses):
-            print("{:.5f}".format(rule_losses[j].item()), rules[j])
         losses.append(loss.item())
         pbar.set_postfix({"loss": loss.item()})
         history.append(loss.item())
@@ -489,8 +318,8 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
             if sample_prompt is not None:
                 os.makedirs("samples/"+name, exist_ok=True)
                 write_sample_png("samples/"+name, model, sampler, sample_start_code, sample_emb, (accumulation_counter//accumulation_steps), ddim_steps)
-
-
+                
+                
         # save checkpoint and loss curve
         if (i+1) % 30 == 0 and i+1 != iterations and i+1>= 20:
             save_model(model, name, i-1, save_compvis=True, save_diffusers=False)
@@ -504,7 +333,7 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
     save_model(model, name, None, save_compvis=True, save_diffusers=False, compvis_config_file=config_path, diffusers_config_file=diffusers_config_path)
     save_history(losses, name, word_print)
 
-def save_model(model, name, num, compvis_config_file=None, diffusers_config_file=None, device='cpu', save_compvis=True, save_diffusers=True):
+def save_model(model, name, num, compvis_config_file=None, diffusers_config_file=None, device="cpu", save_compvis=True, save_diffusers=True):
     # SAVE MODEL
 
 #     PATH = f'{FOLDER}/{model_type}-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{neg_guidance}-iter_{i+1}-lr_{lr}-startmodel_{start_model}-numacc_{numacc}.pt'
@@ -549,15 +378,20 @@ if __name__ == '__main__':
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=50)
     parser.add_argument('--accumulation_steps', help='gradient accumulation steps', type=int, required=False, default=1)
     parser.add_argument('--sample_prompt', help='will create training images with this phrase as SD trains. This requires running through SD and is slower.', type=str, required=False, default=None)
-    parser.add_argument('--mod_count', help='number of mods to use at once', type=int, required=False, default=2)
     parser.add_argument(	
         "--use_8bit_adam",	
         action="store_true",	
         help="use 8bit AdamW optimizer (requires bitsandbytes) / 8bit Adamオプティマイザを使う（bitsandbytesのインストールが必要）",	
     )
+    parser.add_argument(
+        "--lowram",
+        action="store_true",
+        help="enable low RAM optimization. e.g. load models to VRAM instead of RAM (for machines which have bigger VRAM than RAM such as Colab and Kaggle) / メインメモリが少ない環境向け最適化を有効にする。たとえばVRAMにモデルを読み込むなど（ColabやKaggleなどRAMに比べてVRAMが多い環境向け）",
+    )
 
     args = parser.parse_args()
 
+    location = "cuda" if args.lowram else "cpu"
     prompt = args.prompt
     train_method = args.train_method
     start_guidance = args.start_guidance
@@ -572,6 +406,6 @@ if __name__ == '__main__':
     seperator = args.seperator
     image_size = args.image_size
     ddim_steps = args.ddim_steps
-    mod_count = args.mod_count
 
-    train_esd(prompt=prompt, train_method=train_method, start_guidance=start_guidance, negative_guidance=negative_guidance, iterations=iterations, lr=lr, config_path=config_path, ckpt_path=ckpt_path, diffusers_config_path=diffusers_config_path, devices=devices, seperator=seperator, image_size=image_size, ddim_steps=ddim_steps, mod_count=mod_count, sample_prompt=sample_prompt, accumulation_steps=args.accumulation_steps)
+
+    train_esd(prompt=prompt, train_method=train_method, start_guidance=start_guidance, negative_guidance=negative_guidance, iterations=iterations, lr=lr, config_path=config_path, ckpt_path=ckpt_path, diffusers_config_path=diffusers_config_path, devices=devices, seperator=seperator, image_size=image_size, ddim_steps=ddim_steps, sample_prompt=sample_prompt, accumulation_steps=args.accumulation_steps)
