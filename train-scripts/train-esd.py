@@ -47,7 +47,7 @@ def load_model_from_config(config, ckpt, device='cpu', verbose=False):
            for key in f.keys():
                tensors[key] = f.get_tensor(key).cpu()
 
-        global_step = pl_sd["global_step"] if "global_step" in pl_sd else pl_sd
+#         global_step = pl_sd["global_step"] if "global_step" in pl_sd else pl_sd
         sd = tensors#pl_sd["state_dict"]
     else:
         pl_sd = torch.load(ckpt, map_location='cpu')
