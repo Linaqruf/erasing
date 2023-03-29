@@ -209,7 +209,7 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
     losses = []
     if args.use_8bit_adam:
         import bitsandbytes as bnb
-        opt = bnb.optim.AdamW8bit
+        opt = bnb.optim.AdamW8bit(parameters, lr=lr)
     else:
         opt = torch.optim.Adam(parameters, lr=lr)
     criteria = torch.nn.MSELoss()
