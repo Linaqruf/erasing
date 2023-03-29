@@ -27,8 +27,8 @@ def load_model_from_config(config, ckpt, device="cpu", verbose=False):
         config = OmegaConf.load(config)
 
     pl_sd = torch.load(ckpt, map_location="cpu")
-    global_step = pl_sd["global_step"]
-    sd = pl_sd["state_dict"]
+    global_step = pl_sd["global_step"] if "global_step" in pl_sd else pl_sd
+    sd = pl_sd["state_dict"] if "state_dict" in pl_sd else pl_sd
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)
     model.to(device)
@@ -297,7 +297,7 @@ if __name__ == '__main__':
     parser.add_argument('--start_guidance', help='guidance of start image used to train', type=float, required=False, default=3)
     parser.add_argument('--negative_guidance', help='guidance of negative training used to train', type=float, required=False, default=1)
     parser.add_argument('--iterations', help='iterations used to train', type=int, required=False, default=1000)
-    parser.add_argument('--lr', help='learning rate used to train', type=int, required=False, default=1e-5)
+    parser.add_argument('--lr', help='learning rate used to train', type=float, required=False, default=1e-5)
     parser.add_argument('--config_path', help='config path for stable diffusion v1-4 inference', type=str, required=False, default='configs/stable-diffusion/v1-inference.yaml')
     parser.add_argument('--ckpt_path', help='ckpt path for stable diffusion v1-4', type=str, required=False, default='models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt')
     parser.add_argument('--diffusers_config_path', help='diffusers unet config json path', type=str, required=False, default='diffusers_unet_config.json')
