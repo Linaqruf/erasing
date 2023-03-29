@@ -1,7 +1,7 @@
 from omegaconf import OmegaConf
 import torch.optim.lr_scheduler as lr_scheduler
 
-from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 
 import sys; sys.path.append('.')
 import torch
@@ -40,17 +40,10 @@ def load_model_from_config(config, ckpt, device='cpu', verbose=False):
     if isinstance(config, (str, Path)):
         config = OmegaConf.load(config)
 
-    tensors = {}
-
     if is_safetensors(ckpt):
-        with safe_open(ckpt, framework="pt", device='cpu') as f:
-           for key in f.keys():
-               tensors[key] = f.get_tensor(key).cpu()
-
-#         global_step = pl_sd["global_step"] if "global_step" in pl_sd else pl_sd
-        sd = tensors#pl_sd["state_dict"]
+        sd = load_file(ckpt, "cuda")
     else:
-        pl_sd = torch.load(ckpt, map_location='cpu')
+        pl_sd = torch.load(ckpt, map_location='cuda')
         sd = pl_sd["state_dict"] if "state_dict" in pl_sd else pl_sd
 
     model = instantiate_from_config(config.model)
