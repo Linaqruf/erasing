@@ -1,5 +1,7 @@
 from omegaconf import OmegaConf
+from safetensors.torch import save_file, load_file
 import torch
+from torch import autocast
 from PIL import Image
 from torchvision import transforms
 import os
@@ -18,7 +20,15 @@ import shutil
 import pdb
 import argparse
 from convertModels import savemodelDiffusers
+
+import time
+from contextlib import nullcontext
+from PIL import Image
+
 # Util Functions
+def is_safetensors(path):
+    return os.path.splitext(path)[1].lower() == '.safetensors'
+
 def load_model_from_config(config, ckpt, device="cpu", verbose=False):
     """Loads a model from config and a ckpt
     if config is a path will use omegaconf to load
@@ -26,9 +36,12 @@ def load_model_from_config(config, ckpt, device="cpu", verbose=False):
     if isinstance(config, (str, Path)):
         config = OmegaConf.load(config)
 
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    global_step = pl_sd["global_step"]
-    sd = pl_sd["state_dict"]
+    if is_safetensors(ckpt):
+        sd = load_file(ckpt, device=location)
+    else:
+        pl_sd = torch.load(ckpt, map_location=location)
+        sd = pl_sd["state_dict"] if "state_dict" in pl_sd else pl_sd
+        
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)
     model.to(device)
@@ -102,7 +115,40 @@ def get_models(config_path, ckpt_path, devices):
 
     return model_orig, sampler_orig, model, sampler
 
-def train_esd(prompt, train_method, start_guidance, negative_guidance, iterations, lr, config_path, ckpt_path, diffusers_config_path, devices, seperator=None, image_size=512, ddim_steps=50):
+def write_sample_png(name, model, sampler, sample_start_code, sample_emb, step, ddim_steps):
+    start_code = sample_start_code
+    device = sample_start_code.device
+
+    with torch.no_grad():
+        with autocast("cuda"):
+            with model.ema_scope():
+                tic = time.time()
+                uc = None
+                uc = model.get_learned_conditioning([""])
+                c = sample_emb
+                shape = [4, 64, 64]
+                samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                                 conditioning=c,
+                                                 batch_size=1,
+                                                 shape=shape,
+                                                 verbose=False,
+                                                 unconditional_guidance_scale=7.5,
+                                                 unconditional_conditioning=uc,
+                                                 eta=0.0,
+                                                 x_T=start_code)
+
+                x_samples_ddim = model.decode_first_stage(samples_ddim)
+                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).squeeze(0).numpy()
+                x_sample = x_samples_ddim
+
+                x_sample = 255. * x_sample
+                x_sample = x_sample.astype(np.uint8)
+                img = Image.fromarray(x_sample)
+                img.save(f"{name}/{step:05}.png")
+                
+def train_esd(prompt, train_method, start_guidance, negative_guidance, iterations, lr, config_path, ckpt_path, diffusers_config_path, devices, seperator=None, image_size=512, ddim_steps=50,  sample_prompt=None, accumulation_steps=1):
     '''
     Function to train diffusion models to erase concepts from model weights
 
@@ -141,6 +187,7 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
 
     '''
     # PROMPT CLEANING
+
     word_print = prompt.replace(' ','')
     if prompt == 'allartist':
         prompt = "Kelly Mckernan, Thomas Kinkade, Ajin Demi Human, Alena Aenami, Tyler Edlin, Kilian Eng"
@@ -207,13 +254,27 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
                                                                  start_code=code, till_T=t, verbose=False)
 
     losses = []
-    opt = torch.optim.Adam(parameters, lr=lr)
+    if args.use_8bit_adam:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(parameters, lr=lr)
+    else:
+        opt = torch.optim.Adam(parameters, lr=lr)
+
     criteria = torch.nn.MSELoss()
     history = []
 
     name = f'compvis-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{negative_guidance}-iter_{iterations}-lr_{lr}'
     # TRAINING CODE
     pbar = tqdm(range(iterations))
+    
+    if sample_prompt is not None:
+        sample_start_code = torch.randn((1, 4, 64, 64)).to(devices[0])
+        sample_emb = model.get_learned_conditioning([sample_prompt])
+
+        os.makedirs("samples/"+name, exist_ok=True)
+        write_sample_png("samples/"+name, model, sampler, sample_start_code, sample_emb, 0, ddim_steps)
+    accumulation_counter=0
+    
     for i in pbar:
         word = random.sample(words,1)[0]
         # get text embeddings for unconditional and conditional prompts
@@ -250,20 +311,29 @@ def train_esd(prompt, train_method, start_guidance, negative_guidance, iteration
         losses.append(loss.item())
         pbar.set_postfix({"loss": loss.item()})
         history.append(loss.item())
-        opt.step()
+        accumulation_counter+=1
+        if accumulation_counter % accumulation_steps == 0:
+            opt.step()
+            opt.zero_grad()
+            if sample_prompt is not None:
+                os.makedirs("samples/"+name, exist_ok=True)
+                write_sample_png("samples/"+name, model, sampler, sample_start_code, sample_emb, (accumulation_counter//accumulation_steps), ddim_steps)
+                
+                
         # save checkpoint and loss curve
-        if (i+1) % 500 == 0 and i+1 != iterations and i+1>= 500:
+        if (i+1) % 30 == 0 and i+1 != iterations and i+1>= 20:
             save_model(model, name, i-1, save_compvis=True, save_diffusers=False)
 
         if i % 100 == 0:
             save_history(losses, name, word_print)
 
+
     model.eval()
 
-    save_model(model, name, None, save_compvis=True, save_diffusers=True, compvis_config_file=config_path, diffusers_config_file=diffusers_config_path)
+    save_model(model, name, None, save_compvis=True, save_diffusers=False, compvis_config_file=config_path, diffusers_config_file=diffusers_config_path)
     save_history(losses, name, word_print)
 
-def save_model(model, name, num, compvis_config_file=None, diffusers_config_file=None, device='cpu', save_compvis=True, save_diffusers=True):
+def save_model(model, name, num, compvis_config_file=None, diffusers_config_file=None, device="cpu", save_compvis=True, save_diffusers=True):
     # SAVE MODEL
 
 #     PATH = f'{FOLDER}/{model_type}-word_{word_print}-method_{train_method}-sg_{start_guidance}-ng_{neg_guidance}-iter_{i+1}-lr_{lr}-startmodel_{start_model}-numacc_{numacc}.pt'
@@ -271,9 +341,10 @@ def save_model(model, name, num, compvis_config_file=None, diffusers_config_file
     folder_path = f'models/{name}'
     os.makedirs(folder_path, exist_ok=True)
     if num is not None:
-        path = f'{folder_path}/{name}-epoch_{num}.pt'
+        path = f'{folder_path}/{name}-epoch_{num}.ckpt'
     else:
-        path = f'{folder_path}/{name}.pt'
+        path = f'{folder_path}/{name}.ckpt'
+    print("Saved model to "+path)
     if save_compvis:
         torch.save(model.state_dict(), path)
 
@@ -297,7 +368,7 @@ if __name__ == '__main__':
     parser.add_argument('--start_guidance', help='guidance of start image used to train', type=float, required=False, default=3)
     parser.add_argument('--negative_guidance', help='guidance of negative training used to train', type=float, required=False, default=1)
     parser.add_argument('--iterations', help='iterations used to train', type=int, required=False, default=1000)
-    parser.add_argument('--lr', help='learning rate used to train', type=int, required=False, default=1e-5)
+    parser.add_argument('--lr', help='learning rate used to train', type=float, required=False, default=1e-5)
     parser.add_argument('--config_path', help='config path for stable diffusion v1-4 inference', type=str, required=False, default='configs/stable-diffusion/v1-inference.yaml')
     parser.add_argument('--ckpt_path', help='ckpt path for stable diffusion v1-4', type=str, required=False, default='models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt')
     parser.add_argument('--diffusers_config_path', help='diffusers unet config json path', type=str, required=False, default='diffusers_unet_config.json')
@@ -305,13 +376,28 @@ if __name__ == '__main__':
     parser.add_argument('--seperator', help='separator if you want to train bunch of words separately', type=str, required=False, default=None)
     parser.add_argument('--image_size', help='image size used to train', type=int, required=False, default=512)
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=50)
+    parser.add_argument('--accumulation_steps', help='gradient accumulation steps', type=int, required=False, default=1)
+    parser.add_argument('--sample_prompt', help='will create training images with this phrase as SD trains. This requires running through SD and is slower.', type=str, required=False, default=None)
+    parser.add_argument(	
+        "--use_8bit_adam",	
+        action="store_true",	
+        help="use 8bit AdamW optimizer (requires bitsandbytes) / 8bit Adamオプティマイザを使う（bitsandbytesのインストールが必要）",	
+    )
+    parser.add_argument(
+        "--lowram",
+        action="store_true",
+        help="enable low RAM optimization. e.g. load models to VRAM instead of RAM (for machines which have bigger VRAM than RAM such as Colab and Kaggle) / メインメモリが少ない環境向け最適化を有効にする。たとえばVRAMにモデルを読み込むなど（ColabやKaggleなどRAMに比べてVRAMが多い環境向け）",
+    )
+
     args = parser.parse_args()
-    
+
+    location = "cuda" if args.lowram else "cpu"
     prompt = args.prompt
     train_method = args.train_method
     start_guidance = args.start_guidance
     negative_guidance = args.negative_guidance
     iterations = args.iterations
+    sample_prompt = args.sample_prompt
     lr = args.lr
     config_path = args.config_path
     ckpt_path = args.ckpt_path
@@ -321,4 +407,4 @@ if __name__ == '__main__':
     image_size = args.image_size
     ddim_steps = args.ddim_steps
 
-    train_esd(prompt=prompt, train_method=train_method, start_guidance=start_guidance, negative_guidance=negative_guidance, iterations=iterations, lr=lr, config_path=config_path, ckpt_path=ckpt_path, diffusers_config_path=diffusers_config_path, devices=devices, seperator=seperator, image_size=image_size, ddim_steps=ddim_steps)
+    train_esd(prompt=prompt, train_method=train_method, start_guidance=start_guidance, negative_guidance=negative_guidance, iterations=iterations, lr=lr, config_path=config_path, ckpt_path=ckpt_path, diffusers_config_path=diffusers_config_path, devices=devices, seperator=seperator, image_size=image_size, ddim_steps=ddim_steps, sample_prompt=sample_prompt, accumulation_steps=args.accumulation_steps)
